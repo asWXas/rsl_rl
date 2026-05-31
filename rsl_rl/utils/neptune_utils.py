@@ -10,26 +10,27 @@ import os
 from dataclasses import asdict
 from torch.utils.tensorboard import SummaryWriter
 
-from rsl_rl.utils.log_writer import LogWriter
-
 try:
     import neptune
 except ModuleNotFoundError:
-    neptune = None
+    raise ModuleNotFoundError("neptune-client is required to log to Neptune.") from None
 
 
-class NeptuneLogWriter(SummaryWriter, LogWriter):
+class NeptuneSummaryWriter(SummaryWriter):
     """Summary writer for Neptune."""
 
-    def __init__(self, log_dir: str, project_name: str) -> None:
+    def __init__(self, log_dir: str, flush_secs: int, cfg: dict) -> None:
         """Initialize a Neptune run for logging."""
-        if neptune is None:
-            raise ModuleNotFoundError("neptune-client is required to log to Neptune.")
-        super().__init__(log_dir, flush_secs=10)
+        super().__init__(log_dir, flush_secs=flush_secs)
 
         # Get the run name
         run_name = os.path.split(log_dir)[-1]
 
+        # Get neptune project and entity
+        try:
+            project = cfg["neptune_project"]
+        except KeyError:
+            raise KeyError("Please specify neptune_project in the runner config, e.g. legged_gym.") from None
         try:
             token = os.environ["NEPTUNE_API_TOKEN"]
         except KeyError:
@@ -44,7 +45,7 @@ class NeptuneLogWriter(SummaryWriter, LogWriter):
             ) from None
 
         # Initialize neptune
-        neptune_project = entity + "/" + project_name
+        neptune_project = entity + "/" + project
         self.run = neptune.init_run(project=neptune_project, api_token=token)
         self.run["log_dir"].log(run_name)
 
@@ -53,6 +54,14 @@ class NeptuneLogWriter(SummaryWriter, LogWriter):
             "Train/mean_reward/time": "Train/mean_reward_time",
             "Train/mean_episode_length/time": "Train/mean_episode_length_time",
         }
+
+    def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
+        """Upload environment and training configuration to Neptune."""
+        self.run["train_cfg"] = train_cfg
+        try:
+            self.run["env_cfg"] = env_cfg.to_dict()  # type: ignore
+        except Exception:
+            self.run["env_cfg"] = asdict(env_cfg)  # type: ignore
 
     def add_scalar(
         self,
@@ -63,16 +72,18 @@ class NeptuneLogWriter(SummaryWriter, LogWriter):
         new_style: bool = False,
     ) -> None:
         """Log a scalar to both TensorBoard and Neptune."""
-        super().add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime, new_style=new_style)
+        super().add_scalar(
+            tag,
+            scalar_value,
+            global_step=global_step,
+            walltime=walltime,
+            new_style=new_style,
+        )
         self.run[self._map_path(tag)].log(scalar_value, step=global_step)
 
-    def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
-        """Upload environment and training configuration to Neptune."""
-        self.run["train_cfg"] = train_cfg
-        try:
-            self.run["env_cfg"] = env_cfg.to_dict()  # type: ignore
-        except Exception:
-            self.run["env_cfg"] = asdict(env_cfg)  # type: ignore
+    def stop(self) -> None:
+        """Finish the active Neptune run."""
+        self.run.stop()
 
     def save_model(self, model_path: str, it: int) -> None:
         """Upload a model checkpoint artifact to Neptune."""
@@ -82,10 +93,6 @@ class NeptuneLogWriter(SummaryWriter, LogWriter):
         """Upload an arbitrary file artifact to Neptune."""
         name = path.rsplit("/", 1)[-1].split(".")[0]
         self.run["git_diff/" + name].upload(path)
-
-    def stop(self) -> None:
-        """Finish the active Neptune run."""
-        self.run.stop()
 
     def _map_path(self, path: str) -> str:
         """Map metric names to Neptune-compatible keys."""

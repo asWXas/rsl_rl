@@ -7,10 +7,15 @@
 
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import Symmetry, resolve_symmetry_config
+#----- DreamerWaq extensions -----#
+from .vae import CENetVAE, CENetVAEConfig
 
 __all__ = [
     "RandomNetworkDistillation",
     "Symmetry",
     "resolve_rnd_config",
     "resolve_symmetry_config",
+    #----- DreamerWaq extensions -----#
+    "CENetVAE",
+    "CENetVAEConfig"
 ]
