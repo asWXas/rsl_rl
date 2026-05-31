@@ -6,5 +6,6 @@
 """Storage for the learning algorithms."""
 
 from .rollout_storage import RolloutStorage
+from .waq_storage import WaqBatch, WaqRolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["RolloutStorage", "WaqBatch", "WaqRolloutStorage"]

@@ -7,8 +7,11 @@
 
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import Symmetry, resolve_symmetry_config
+from .vae import CENetVAE, CENetVAEConfig
 
 __all__ = [
+    "CENetVAE",
+    "CENetVAEConfig",
     "RandomNetworkDistillation",
     "Symmetry",
     "resolve_rnd_config",
