@@ -52,4 +52,8 @@ If you use RSL-RL in your research, please cite the [paper](https://arxiv.org/ab
   journal={arXiv preprint arXiv:2509.10771},
   year={2025}
 }
+{
+  dream_waq
+}
+
 ```
