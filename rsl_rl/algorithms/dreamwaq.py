@@ -545,7 +545,7 @@ class DreamWaQ:
             # 先拿到完整的 VAE 字典
             full_vae_sd = self.waq_vae.state_dict()
             
-            # 利用字典推导式，把带有 "decoder" 的分到一边，其他的(包括 encoder, latent_mu, vel_mu 等)分到另一边
+            # 利用字典推导式，把带有 "decoder" 的分到一边，其他的(包括 encoder, shared_head 等)分到另一边
             encoder_sd = {k: v for k, v in full_vae_sd.items() if not k.startswith("decoder.")}
             decoder_sd = {k: v for k, v in full_vae_sd.items() if k.startswith("decoder.")}
             
