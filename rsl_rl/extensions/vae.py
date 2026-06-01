@@ -94,10 +94,13 @@ class CENetVAE(nn.Module):
             activation=cfg.activation,
             last_activation=True,
         )
-        self.latent_mu = nn.Linear(encoder_out_dim, cfg.latent_dim)
-        self.latent_logvar = nn.Linear(encoder_out_dim, cfg.latent_dim)
-        self.vel_mu = nn.Linear(encoder_out_dim, 3)
-        self.vel_logvar = nn.Linear(encoder_out_dim, 3)
+        self.z_dim = cfg.latent_dim  # 16
+        self.vel_dim = 3
+        self.total_param_dim = 2 * self.z_dim + 2 * self.vel_dim  # 38
+        self.shared_head = nn.Linear(encoder_out_dim, self.total_param_dim)
+        nn.init.orthogonal_(self.shared_head.weight)
+        nn.init.constant_(self.shared_head.bias, 0.0)
+
         self.decoder = _build_mlp(
             in_dim=cfg.latent_dim + 3,
             hidden_dims=cfg.decoder_hidden_dims,
@@ -137,11 +140,17 @@ class CENetVAE(nn.Module):
         """Encode observation history into latent and velocity distributions."""
         batch_size = obs_history.shape[0]
         features = self.encoder(obs_history.reshape(batch_size, -1))
+        # 1 次共享投影 → 联合学习 4 组 VAE 参数
+        params = self.shared_head(features)
+        # 零成本按维度切分
+        z_mu, z_logvar, vel_mu, vel_logvar = params.split(
+            [self.z_dim, self.z_dim, self.vel_dim, self.vel_dim], dim=-1
+        )
         return {
-            "z_mu": self.latent_mu(features),
-            "z_logvar": self.latent_logvar(features),
-            "vel_mu": self.vel_mu(features),
-            "vel_logvar": self.vel_logvar(features),
+            "z_mu": z_mu,
+            "z_logvar": z_logvar,
+            "vel_mu": vel_mu,
+            "vel_logvar": vel_logvar,
         }
 
     def decode(self, z: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
