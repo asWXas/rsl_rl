@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 
+import copy
 import os
 import time
 import torch
+import torch.nn as nn
+from typing import Any
 
 from rsl_rl.algorithms import DreamWaQ
 from rsl_rl.env import VecEnv
@@ -230,8 +233,13 @@ class DreamWaQRunner():
         
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
         """Export the model to a Torch JIT file."""
-        jit_model = self.alg.get_policy().as_jit()
+        waq_vae = getattr(self.alg, "waq_vae", None)
+        if waq_vae is None:
+            jit_model = self.alg.get_policy().as_jit()
+        else:
+            jit_model = _DreamWaQExportPolicy(self.alg.get_policy(), waq_vae, verbose=False)
         jit_model.to("cpu")
+        jit_model.eval()
 
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
@@ -243,7 +251,11 @@ class DreamWaQRunner():
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
         """Export the model into an ONNX file."""
-        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
+        waq_vae = getattr(self.alg, "waq_vae", None)
+        if waq_vae is None:
+            onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
+        else:
+            onnx_model = _DreamWaQExportPolicy(self.alg.get_policy(), waq_vae, verbose)
         onnx_model.to("cpu")
         onnx_model.eval()
 
@@ -263,3 +275,57 @@ class DreamWaQRunner():
             output_names=onnx_model.output_names,  # type: ignore
         )
 
+
+class _DreamWaQExportPolicy(nn.Module):
+    """Exportable CENet + actor policy without TensorDict inputs."""
+
+    is_recurrent: bool = False
+
+    def __init__(self, actor: WaqMLPModel, waq_vae: Any, verbose: bool) -> None:
+        super().__init__()
+        self.verbose = verbose
+        self.obs_dim = waq_vae.cfg.obs_dim
+        self.history_length = waq_vae.cfg.history_length
+        self.latent_dim = waq_vae.cfg.latent_dim
+        self.input_size = self.obs_dim * self.history_length
+
+        self.waq_encoder = copy.deepcopy(waq_vae.encoder)
+        self.waq_shared_head = copy.deepcopy(waq_vae.shared_head)
+        self.obs_normalizer = copy.deepcopy(actor.obs_normalizer)
+        self.mlp = copy.deepcopy(actor.mlp)
+        if actor.distribution is not None:
+            self.deterministic_output = actor.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def forward(self, obs_history: torch.Tensor) -> torch.Tensor:
+        """Run CENet inference and deterministic actor inference."""
+        obs_history = obs_history.reshape(obs_history.shape[0], self.input_size)
+        waq_features = self.waq_encoder(obs_history)
+        waq_head = self.waq_shared_head(waq_features)
+        latent_z = waq_head[..., : self.latent_dim]
+        pred_v = waq_head[..., 2 * self.latent_dim : 2 * self.latent_dim + 3]
+
+        actor_obs = self.obs_normalizer(obs_history)
+        actor_input = torch.cat([actor_obs, latent_z, pred_v], dim=-1)
+        out = self.mlp(actor_input)
+        return self.deterministic_output(out)
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor]:
+        """Return representative dummy inputs for ONNX tracing."""
+        return (torch.zeros(1, self.input_size),)
+
+    @property
+    def input_names(self) -> list[str]:
+        """Return ONNX input tensor names."""
+        return ["obs_history"]
+
+    @property
+    def output_names(self) -> list[str]:
+        """Return ONNX output tensor names."""
+        return ["actions"]
+
+    @torch.jit.export
+    def reset(self) -> None:
+        """Reset recurrent export state (no-op for MLP exports)."""
+        pass

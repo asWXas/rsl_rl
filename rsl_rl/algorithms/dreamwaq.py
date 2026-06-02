@@ -284,10 +284,11 @@ class DreamWaQ:
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
         # DreamWaQ / CENet losses
-        mean_waq_vae_loss = 0 if getattr(self, "waq_vae", None) is not None else None
-        mean_waq_est_loss = 0 if getattr(self, "waq_vae", None) is not None else None
-        mean_waq_recons_loss = 0 if getattr(self, "waq_vae", None) is not None else None
-        mean_waq_kld_loss = 0 if getattr(self, "waq_vae", None) is not None else None
+        has_waq_vae = getattr(self, "waq_vae", None) is not None
+        mean_waq_vae_loss = 0.0
+        mean_waq_est_loss = 0.0
+        mean_waq_recons_loss = 0.0
+        mean_waq_kld_loss = 0.0
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -469,7 +470,7 @@ class DreamWaQ:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        if mean_waq_vae_loss is not None:
+        if has_waq_vae:
             mean_waq_vae_loss /= num_updates
             mean_waq_est_loss /= num_updates
             mean_waq_recons_loss /= num_updates
@@ -485,7 +486,7 @@ class DreamWaQ:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
-        if mean_waq_vae_loss is not None:
+        if has_waq_vae:
             loss_dict["waq_vae"] = mean_waq_vae_loss
             loss_dict["waq_est"] = mean_waq_est_loss
             loss_dict["waq_recons"] = mean_waq_recons_loss
@@ -502,6 +503,9 @@ class DreamWaQ:
         self.critic.train()
         if self.rnd:
             self.rnd.train()
+        waq_vae = getattr(self, "waq_vae", None)
+        if waq_vae is not None:
+            waq_vae.train()
 
     def eval_mode(self) -> None:
         """Set evaluation mode for learnable models."""
@@ -509,6 +513,9 @@ class DreamWaQ:
         self.critic.eval()
         if self.rnd:
             self.rnd.eval()
+        waq_vae = getattr(self, "waq_vae", None)
+        if waq_vae is not None:
+            waq_vae.eval()
 
     def save(self) -> dict:
         """Return a dict of all models for saving."""
@@ -520,6 +527,12 @@ class DreamWaQ:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        waq_vae = getattr(self, "waq_vae", None)
+        waq_vae_optimizer = getattr(self, "waq_vae_optimizer", None)
+        if waq_vae is not None:
+            saved_dict["waq_vae_state_dict"] = waq_vae.state_dict()
+        if waq_vae_optimizer is not None:
+            saved_dict["waq_vae_optimizer_state_dict"] = waq_vae_optimizer.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -532,6 +545,7 @@ class DreamWaQ:
                 "optimizer": True,
                 "iteration": True,
                 "rnd": True,
+                "waq_vae": True,
             }
 
         # Load the specified models
@@ -544,6 +558,16 @@ class DreamWaQ:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        waq_vae = getattr(self, "waq_vae", None)
+        waq_vae_optimizer = getattr(self, "waq_vae_optimizer", None)
+        if load_cfg.get("waq_vae") and waq_vae is not None and "waq_vae_state_dict" in loaded_dict:
+            waq_vae.load_state_dict(loaded_dict["waq_vae_state_dict"], strict=strict)
+        if (
+            load_cfg.get("optimizer")
+            and waq_vae_optimizer is not None
+            and "waq_vae_optimizer_state_dict" in loaded_dict
+        ):
+            waq_vae_optimizer.load_state_dict(loaded_dict["waq_vae_optimizer_state_dict"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
