@@ -87,9 +87,13 @@ class DreamWaQ:
             self.waq_vae_optimizer = self.waq_vae.create_optimizer()
             
             history_features_dim = cfg.obs_dim * cfg.history_length  # 历史观测堆叠的维度
-            action_input_dim = history_features_dim + cfg.latent_dim + 3 # 当前观测 + VAE隐变量 + 预测速度
-            if action_input_dim != actor.obs_dim:
-                raise ValueError(f"Actor model input_dim ({actor.obs_dim}) does not match expected action_input_dim ({action_input_dim}). Please check the configuration.")
+            expected_action_input_dim = history_features_dim + cfg.latent_dim + 3
+            actual_action_input_dim = actor.obs_dim + actor.waq_input_dim
+            if actual_action_input_dim != expected_action_input_dim:
+                raise ValueError(
+                    f"Actor model input_dim ({actual_action_input_dim}) does not match expected "
+                    f"action_input_dim ({expected_action_input_dim}). Please check the configuration."
+                )
             
             self.term_dims = cfg.term_dims 
             hist_len = cfg.history_length
@@ -116,7 +120,7 @@ class DreamWaQ:
             print("          ┌──────────┴──────────┐")
             print("          ▼                     ▼")
             print("    [ Actor Model ]       [ Critic Model ]")
-            print(f"    (in: {action_input_dim} ──► out: 12)  (in: {self.critic.obs_dim} ──► out: 1)")
+            print(f"    (in: {expected_action_input_dim} ──► out: 12)  (in: {self.critic.obs_dim} ──► out: 1)")
             print("="*60 + "\n")
             
 
@@ -606,7 +610,7 @@ class DreamWaQ:
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
 
         # Initialize the policy
-        waq_vae_cfg = cfg["algorithm"].get("vae_cfg", cfg["algorithm"].get("waq_vae_cfg", None))
+        waq_vae_cfg = cfg["algorithm"].get("vae_cfg", None)
         if waq_vae_cfg is not None:
             waq_action_input_dim = waq_vae_cfg.get("latent_dim", 0) + 3
             obs_device = obs.device if obs.device is not None else device
@@ -632,7 +636,19 @@ class DreamWaQ:
         print(f"Critic Model: {critic}")
 
         # Initialize the storage
-        storage = WaqRolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        next_obs_shapes = None
+        if waq_vae_cfg is not None:
+            actor_group = cfg["obs_groups"]["actor"][0]
+            next_obs_shapes = {actor_group: waq_vae_cfg.get("obs_dim", 0)}
+        storage = WaqRolloutStorage(
+            "rl",
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+            next_obs_shapes=next_obs_shapes,
+            device=device,
+        )
 
         # Initialize the algorithm
         alg: DreamWaQ = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])

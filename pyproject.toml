@@ -58,6 +58,8 @@ enableTypeIgnoreComments = true
 # This is required as the CI pre-commit does not download the module (i.e. numpy, torch, prettytable)
 reportMissingImports = "none"
 # This is required to ignore type checks of modules with stubs missing.
+# @configclass decorator dynamically generates __init__, Pyright cannot infer its signature.
+reportCallIssue = "none"
 reportMissingModuleSource = "none"  # -> most common: prettytable in mdp managers
 reportGeneralTypeIssues = "none"  # -> usage of literal MISSING in dataclasses
 reportOptionalMemberAccess = "none"

@@ -66,11 +66,21 @@ class WaqRolloutStorage(RolloutStorage):
         num_transitions_per_env: int,
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
+        next_obs_shapes: dict[str, int] | None = None,
         device: str = "cpu",
     ) -> None:
         super().__init__(training_type, num_envs, num_transitions_per_env, obs, actions_shape, device)
+        if next_obs_shapes is None:
+            next_obs_tensors = {
+                key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()
+            }
+        else:
+            next_obs_tensors = {
+                key: torch.zeros(num_transitions_per_env, num_envs, dim, device=device)
+                for key, dim in next_obs_shapes.items()
+            }
         self.next_observations = TensorDict(
-            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
+            next_obs_tensors,
             batch_size=[num_transitions_per_env, num_envs],
             device=self.device,
         )

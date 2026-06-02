@@ -60,11 +60,13 @@ class CENetConfig:
     optimizer_type: str = "adam"
     weight_decay: float = 1e-5
 
+
     def __post_init__(self) -> None:
         self.obs_dim = int(self.obs_dim)
         self.history_length = int(self.history_length)
         self.latent_dim = int(self.latent_dim)
         self.activation = self.activation.lower()
+        self.optimizer_type = self.optimizer_type.lower()
 
 
 # ---------------------------------------------------------
@@ -133,7 +135,11 @@ class CENet(nn.Module):
     def create_optimizer(self) -> torch.optim.Optimizer:
         if self.cfg.optimizer_type == "adam":
             return torch.optim.Adam(self.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
-        raise ValueError(f"Unsupported optimizer")
+        if self.cfg.optimizer_type == "adamw":
+            return torch.optim.AdamW(self.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
+        if self.cfg.optimizer_type == "sgd":
+            return torch.optim.SGD(self.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
+        raise ValueError(f"Unsupported optimizer: {self.cfg.optimizer_type}")
 
     def encode(self, obs_history: torch.Tensor) -> CENetState:
         """编码观测历史，分离出隐变量 z 的分布和确定的速度估计 v_t"""
