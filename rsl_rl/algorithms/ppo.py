@@ -397,6 +397,18 @@ class PPO:
         """Get the policy model."""
         return self._raw_actor
 
+    def get_inference_policy(self) -> nn.Module:
+        """Return the policy module used for environment rollout inference."""
+        return self.get_policy()
+
+    def get_export_policy_jit(self) -> nn.Module:
+        """Return the policy module used for TorchScript export."""
+        return self.get_policy().as_jit()
+
+    def get_export_policy_onnx(self, verbose: bool = False) -> nn.Module:
+        """Return the policy module used for ONNX export."""
+        return self.get_policy().as_onnx(verbose=verbose)
+
     def compile(self, mode: str | None = None) -> None:
         """Compile actor and critic with ``torch.compile``.
 

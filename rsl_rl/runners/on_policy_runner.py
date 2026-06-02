@@ -12,7 +12,6 @@ import torch
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
-from rsl_rl.models import MLPModel
 from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
 
@@ -160,14 +159,14 @@ class OnPolicyRunner:
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
-    def get_inference_policy(self, device: str | None = None) -> MLPModel:
+    def get_inference_policy(self, device: str | None = None) -> torch.nn.Module:
         """Return the policy on the requested device for inference."""
         self.alg.eval_mode()  # Switch to evaluation mode (e.g. for dropout)
-        return self.alg.get_policy().to(device)  # type: ignore
+        return self.alg.get_inference_policy().to(device)  # type: ignore
 
     def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
         """Export the model to a Torch JIT file."""
-        jit_model = self.alg.get_policy().as_jit()
+        jit_model = self.alg.get_export_policy_jit()
         jit_model.to("cpu")
 
         if not os.path.exists(path):
@@ -180,7 +179,7 @@ class OnPolicyRunner:
 
     def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
         """Export the model into an ONNX file."""
-        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
+        onnx_model = self.alg.get_export_policy_onnx(verbose=verbose)
         onnx_model.to("cpu")
         onnx_model.eval()
 

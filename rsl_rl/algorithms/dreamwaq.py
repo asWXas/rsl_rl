@@ -15,9 +15,48 @@ from typing import Any
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import CENetVAE, CENetVAEConfig, resolve_rnd_config, resolve_symmetry_config
-from rsl_rl.models import MLPModel, WaqMLPModel
+from rsl_rl.models import DreamWaQExportModel, MLPModel, WaqMLPModel
 from rsl_rl.storage import WaqBatch, WaqRolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups
+
+
+class DreamWaQInferencePolicy(nn.Module):
+    """TensorDict inference wrapper that injects DreamWaQ VAE predictions before the actor."""
+
+    def __init__(self, actor: WaqMLPModel, vae: CENetVAE, history_group: str) -> None:
+        """Store actor, VAE, and observation-group routing for inference."""
+        super().__init__()
+        self.actor = actor
+        self.vae = vae
+        self.history_group = history_group
+
+    def forward(self, obs: TensorDict) -> torch.Tensor:
+        """Run deterministic inference from environment observations to actions."""
+        actor_obs = obs.clone()
+        obs_history = self._reshape_history(actor_obs[self.history_group])
+        pred = self.vae.infer(obs_history)
+        actor_obs["latent_z"] = pred["z"]
+        actor_obs["pred_v"] = pred["velocity"]
+        return self.actor(actor_obs, stochastic_output=False)
+
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        """Reset actor recurrent state if present."""
+        self.actor.reset(dones)
+
+    def _reshape_history(self, obs_history: torch.Tensor) -> torch.Tensor:
+        if obs_history.dim() == 3:
+            return obs_history
+        if obs_history.dim() != 2:
+            raise ValueError(f"Expected 2D or 3D DreamWaQ history observations, got shape {obs_history.shape}.")
+
+        cfg = self.vae.cfg
+        expected_flat_dim = cfg.history_length * cfg.obs_dim
+        if obs_history.shape[-1] != expected_flat_dim:
+            raise ValueError(
+                f"DreamWaQ history observation width ({obs_history.shape[-1]}) does not match "
+                f"history_length * obs_dim ({expected_flat_dim})."
+            )
+        return obs_history.view(obs_history.shape[0], cfg.history_length, cfg.obs_dim)
 
 
 class DreamWaQ(PPO):
@@ -330,6 +369,24 @@ class DreamWaQ(PPO):
         self.actor = compile_model(self._raw_actor, mode)  # type: ignore
         self.critic = compile_model(self._raw_critic, mode)  # type: ignore
 
+    def get_inference_policy(self) -> nn.Module:
+        """Return a TensorDict policy that injects VAE predictions before actor inference."""
+        if self.waq_vae is None:
+            return super().get_inference_policy()
+        return DreamWaQInferencePolicy(self._raw_actor, self.waq_vae, self.waq_history_group)
+
+    def get_export_policy_jit(self) -> nn.Module:
+        """Return an end-to-end DreamWaQ policy for TorchScript export."""
+        if self.waq_vae is None:
+            return super().get_export_policy_jit()
+        return DreamWaQExportModel(self._raw_actor, self.waq_vae)
+
+    def get_export_policy_onnx(self, verbose: bool = False) -> nn.Module:
+        """Return an end-to-end DreamWaQ policy for ONNX export."""
+        if self.waq_vae is None:
+            return super().get_export_policy_onnx(verbose=verbose)
+        return DreamWaQExportModel(self._raw_actor, self.waq_vae)
+
     def broadcast_parameters(self) -> None:
         """Broadcast policy, value, RND, and VAE parameters across distributed workers."""
         super().broadcast_parameters()
@@ -403,7 +460,7 @@ class DreamWaQ(PPO):
             return
         with torch.no_grad():
             obs_history = self._reshape_history(obs[self.waq_history_group])
-            pred = self.waq_vae.predict(obs_history, deterministic=True)
+            pred = self.waq_vae.infer(obs_history)
             obs["latent_z"] = pred["z"]
             obs["pred_v"] = pred["velocity"]
 
