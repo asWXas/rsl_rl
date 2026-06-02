@@ -8,7 +8,7 @@
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .symmetry import Symmetry, resolve_symmetry_config
 #----- DreamerWaq extensions -----#
-from .vae import CENetVAE, CENetVAEConfig
+from .vae import CENet, CENetConfig
 
 __all__ = [
     "RandomNetworkDistillation",
@@ -16,6 +16,6 @@ __all__ = [
     "resolve_rnd_config",
     "resolve_symmetry_config",
     #----- DreamerWaq extensions -----#
-    "CENetVAE",
-    "CENetVAEConfig"
+    "CENet",
+    "CENetConfig",
 ]

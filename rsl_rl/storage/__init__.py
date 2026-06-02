@@ -8,4 +8,4 @@
 from .rollout_storage import RolloutStorage
 from .waq_storage import WaqRolloutStorage
 
-__all__ = ["RolloutStorage","WaqRolloutStorage"]
+__all__ = ["RolloutStorage", "WaqRolloutStorage"]

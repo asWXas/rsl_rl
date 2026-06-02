@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+
 import os
 import time
 import torch
 
-
 from rsl_rl.algorithms import DreamWaQ
 from rsl_rl.env import VecEnv
-from rsl_rl.models import MLPModel
+from rsl_rl.models import WaqMLPModel
 from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
 
@@ -19,17 +19,16 @@ class DreamWaQRunner():
         self.env = env
         self.cfg = train_cfg
         self.device = device
-        
+
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
 
         # Query observations from the environment for algorithm construction
         obs = self.env.get_observations()
-        
+
         # Create the algorithm
         alg_class: type[DreamWaQ] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
-        
 
         # Create the logger
         self.logger = Logger(
@@ -44,6 +43,13 @@ class DreamWaQRunner():
         )
 
         self.current_learning_iteration = 0
+        
+        
+        
+        self.adaboot_cur_returns = torch.zeros(self.env.num_envs, 1, device=self.device)
+        self.adaboot_return_buffer: list[torch.Tensor] = []
+
+        
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Run the learning loop for the specified number of iterations."""
@@ -69,6 +75,11 @@ class DreamWaQRunner():
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
+            if hasattr(self.alg, "waq_vae") and len(self.adaboot_return_buffer) > 0:
+                episode_rewards = torch.cat(self.adaboot_return_buffer)
+                self.alg.update_adaboot_prob(episode_rewards)
+                self.adaboot_return_buffer.clear()
+            
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -82,6 +93,17 @@ class DreamWaQRunner():
                         check_nan(obs, rewards, dones)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    
+                    if hasattr(self.alg, "waq_vae"):
+                        self.adaboot_cur_returns += rewards.view(-1, 1)
+
+                        done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
+                        if done_ids.numel() > 0:
+                            self.adaboot_return_buffer.append(
+                                self.adaboot_cur_returns[done_ids].detach().clone().flatten()
+                            )
+                            self.adaboot_cur_returns[done_ids] = 0.0
+                    
                     # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards if RND is used (only for logging)
@@ -113,7 +135,7 @@ class DreamWaQRunner():
                 loss_dict=loss_dict,
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.get_policy().output_std,
-                rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None, # type: ignore
+                rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
             )
 
             # Save model
@@ -152,45 +174,10 @@ class DreamWaQRunner():
             self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
-    def get_inference_policy(self, device: str | None = None) -> MLPModel:
+    def get_inference_policy(self, device: str | None = None) -> WaqMLPModel:
         """Return the policy on the requested device for inference."""
         self.alg.eval_mode()  # Switch to evaluation mode (e.g. for dropout)
         return self.alg.get_policy().to(device)  # type: ignore
-
-    def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
-        """Export the model to a Torch JIT file."""
-        jit_model = self.alg.get_policy().as_jit()
-        jit_model.to("cpu")
-
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        save_path = os.path.join(path, filename)
-
-        # Trace and save the model
-        traced_model = torch.jit.script(jit_model)
-        traced_model.save(save_path)
-
-    def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
-        """Export the model into an ONNX file."""
-        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
-        onnx_model.to("cpu")
-        onnx_model.eval()
-
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        save_path = os.path.join(path, filename)
-
-        # Trace and save the model
-        torch.onnx.export(
-            onnx_model,
-            onnx_model.get_dummy_inputs(),  # type: ignore
-            save_path,
-            export_params=True,
-            opset_version=18,
-            verbose=verbose,
-            input_names=onnx_model.input_names,  # type: ignore
-            output_names=onnx_model.output_names,  # type: ignore
-        )
 
     def add_git_repo_to_log(self, repo_file_path: str) -> None:
         """Register a repository path whose git status should be logged."""
@@ -239,3 +226,40 @@ class DreamWaQRunner():
         torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
+        
+        
+    def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
+        """Export the model to a Torch JIT file."""
+        jit_model = self.alg.get_policy().as_jit()
+        jit_model.to("cpu")
+
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        save_path = os.path.join(path, filename)
+
+        # Trace and save the model
+        traced_model = torch.jit.script(jit_model)
+        traced_model.save(save_path)
+
+    def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
+        """Export the model into an ONNX file."""
+        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
+        onnx_model.to("cpu")
+        onnx_model.eval()
+
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        save_path = os.path.join(path, filename)
+
+        # Trace and save the model
+        torch.onnx.export(
+            onnx_model,
+            onnx_model.get_dummy_inputs(),  # type: ignore
+            save_path,
+            export_params=True,
+            opset_version=18,
+            verbose=verbose,
+            input_names=onnx_model.input_names,  # type: ignore
+            output_names=onnx_model.output_names,  # type: ignore
+        )
+

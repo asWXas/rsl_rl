@@ -199,109 +199,47 @@ class WaqMLPModel(MLPModel):
 
     def __init__(
         self,
-        waq_input_dim: int,  # 新增：预留给后续拼接的额外维度
-        obs: TensorDict,
-        obs_groups: dict[str, list[str]],
-        obs_set: str,
-        output_dim: int,
-        hidden_dims: tuple[int, ...] | list[int] = (256, 256, 256),
-        activation: str = "elu",
-        obs_normalization: bool = False,
-        distribution_cfg: dict | None = None,
+        waq_input_dim: int, 
+        *args, 
+        **kwargs,
     ) -> None:
         self.waq_input_dim = waq_input_dim
-        
-        # 调用父类初始化。
-        # 此时父类会调用我们重写的 _get_obs_dim，自动把 MLP 的输入维度建对！
-        # 但副作用是：如果开启了 obs_normalization，normalizer 的维度也被建大了
-        super().__init__(
-            obs=obs,
-            obs_groups=obs_groups,
-            obs_set=obs_set,
-            output_dim=output_dim,
-            hidden_dims=hidden_dims,
-            activation=activation,
-            obs_normalization=obs_normalization,
-            distribution_cfg=distribution_cfg,
-        )
+        # 直接调用父类初始化。
+        # 此时父类的 Normalizer 会正确地只处理环境基础维度。
+        super().__init__(*args, **kwargs)
 
-        # 【填平归一化陷阱】
-        # 将 normalizer 的维度改回仅针对真实环境观测的维度 (base_obs_dim)
-        if self.obs_normalization:
-            base_obs_dim = self.obs_dim - self.waq_input_dim
-            # 使用原 normalizer 的类重新实例化，免去重新 import 的麻烦
-            self.obs_normalizer = type(self.obs_normalizer)(base_obs_dim)
-            
-            
-    def forward(
-        self,
-        obs: TensorDict,
-        masks: torch.Tensor | None = None,
-        hidden_state: HiddenState = None,
-        stochastic_output: bool = False,
-    ) -> torch.Tensor:
-        """Forward pass of the MLP model.
-
-        ..note::
-            The `stochastic_output` flag only has an effect if the model has a distribution (i.e., ``distribution_cfg``
-            was provided) and defaults to ``False``, meaning that even stochastic models will return deterministic
-            outputs by default.
+    def _get_latent_dim(self) -> int:
+        """【精髓 1】重写父类的隐藏维度钩子。
+        告诉父类：构造 MLP 线性层的时候，输入维度要加上 waq_input_dim！
         """
-        # If observations are padded for recurrent training but the model is non-recurrent, unpad the observations
-        obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
-        # Get MLP input latent
-        latent = self.get_latent(obs, masks, hidden_state)
-        # MLP forward pass
-        mlp_output = self.mlp(latent)
-        # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
-        if self.distribution is not None:
-            if stochastic_output:
-                self.distribution.update(mlp_output)
-                return self.distribution.sample()
-            return self.distribution.deterministic_output(mlp_output)
-        return mlp_output
-    
+        return self.obs_dim + self.waq_input_dim
+
     def get_latent(
-        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state = None
+        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
     ) -> torch.Tensor:
         """提取基础特征进行归一化，然后拼接 VAE 结果"""
         
-        # 1. 提取基础观测 (12维) 并进行归一化
-        obs_list = [obs[obs_group] for obs_group in self.obs_groups]
-        base_latent = torch.cat(obs_list, dim=-1)
-        base_latent = self.obs_normalizer(base_latent)
+        # 【精髓 2】极度优雅：直接调用父类的 get_latent。
+        # 它会自动帮你完成基础观测的提取、拼接和 Normalization！
+        base_latent = super().get_latent(obs, masks, hidden_state)
         
-        # 2. 拼接 VAE 的隐变量 (16维) 和预测速度 (3维) -> 总计 31 维
+        # 拼接 VAE 的隐变量和预测速度
         if "latent_z" in obs.keys() and "pred_v" in obs.keys():
-            return torch.cat([base_latent, obs["latent_z"], obs["pred_v"]], dim=-1)
+            waq_feature = torch.cat([obs["latent_z"], obs["pred_v"]], dim=-1)
+            
+            # 【建议】增加一道安全校验，防止由于配置错误导致底层 CUDA 矩阵乘法崩溃
+            assert waq_feature.shape[-1] == self.waq_input_dim, \
+                f"WAQ特征维度不匹配! 预期 {self.waq_input_dim}, 实际 {waq_feature.shape[-1]}"
+                
+            return torch.cat([base_latent, waq_feature], dim=-1)
         else:
-            # 初始化或尚未推理时，用零张量补齐 19 维，防止矩阵乘法崩溃
+            # 初始化或尚未推理时，用零张量补齐，防止矩阵乘法崩溃
             dummy_waq = torch.zeros(
                 base_latent.shape[0], 
                 self.waq_input_dim, 
                 device=base_latent.device
             )
             return torch.cat([base_latent, dummy_waq], dim=-1)
-    
-
-    def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
-        """重写父类方法：在原有的 obs_dim 基础上加上 waq_input_dim"""
-        active_obs_groups, base_obs_dim = super()._get_obs_dim(obs, obs_groups, obs_set)
-        return active_obs_groups, base_obs_dim + getattr(self, "waq_input_dim", 0)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 class _TorchMLPModel(nn.Module):
     """Exportable MLP model for JIT."""

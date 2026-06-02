@@ -1,41 +1,33 @@
-
-
-from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from collections.abc import Iterable
+from dataclasses import dataclass
 
-# 这是一个可重用的CENet风格VAE模块，输入是obs_history、next_obs和target_velocity，输出是重构的next_obs和预测的velocity，以及潜在变量z。它包含编码器和解码器网络，并提供了计算损失和更新参数的函数。
-# 论文 DreamWaQ
+_SUPPORTED_ACTIVATIONS = {"elu", "relu", "leaky_relu", "tanh", "silu"}
+_SUPPORTED_OPTIMIZERS = {"adam", "adamw", "sgd"}
+
 
 def _get_activation(name: str) -> nn.Module:
     act = name.lower()
-    if act == "elu":
-        return nn.ELU()
-    if act == "relu":
-        return nn.ReLU()
-    if act == "leaky_relu":
-        return nn.LeakyReLU(negative_slope=0.2)
-    if act == "tanh":
-        return nn.Tanh()
-    if act == "silu":
-        return nn.SiLU()
+    if act == "elu": return nn.ELU()
+    if act == "relu": return nn.ReLU()
+    if act == "leaky_relu": return nn.LeakyReLU(negative_slope=0.2)
+    if act == "tanh": return nn.Tanh()
+    if act == "silu": return nn.SiLU()
     raise ValueError(f"Unsupported activation: {name}")
 
-# 🚀 [修改点 1]：增加 last_activation 参数，支持在最后一层后添加激活函数
+
 def _build_mlp(in_dim: int, hidden_dims: Iterable[int], out_dim: int, activation: str, last_activation: bool = False) -> nn.Sequential:
-    layers = []
+    layers: list[nn.Module] = []
     dims = [in_dim, *hidden_dims]
     for i in range(len(dims) - 1):
         layers.append(nn.Linear(dims[i], dims[i + 1]))
         layers.append(_get_activation(activation))
     layers.append(nn.Linear(dims[-1], out_dim))
-    
     if last_activation:
         layers.append(_get_activation(activation))
-        
     return nn.Sequential(*layers)
 
 
@@ -47,234 +39,226 @@ def _orthogonal_init(module: nn.Module) -> None:
 
 
 @dataclass
-class CENetVAEConfig:
+class CENetConfig:
+    """Configuration strictly matched to DreamWaQ CENet paper."""
     obs_dim: int = 1
     history_length: int = 1
-    latent_dim: int = 16
-    encoder_hidden_dims: Tuple[int, ...] = (512, 256)
-    decoder_hidden_dims: Tuple[int, ...] = (512, 256, 128)
-    activation: str = "silu"
-    beta: float = 1.0
-    learning_rate: float = 1e-3
-    max_grad_norm: float = 1.0
-    decode_with_target_velocity: bool = True
-    velocity_loss_use_sample: bool = True
-    term_dims: Tuple[int, ...] = (0,)
+    latent_dim: int = 16  # z_t dimension
+    encoder_hidden_dims: tuple[int, ...] = (128, 64)  # 参考论文架构图
+    decoder_hidden_dims: tuple[int, ...] = (64, 128)  # 参考论文架构图
+    activation: str = "elu"  # RL领域常用ELU
     
-    optimizer_type: str = "adam"   # 可选 "adam", "adamw", "sgd"
-    weight_decay: float = 1e-5      # 推荐给 AdamW 设置 1e-4 或 1e-5
+    beta: float = 1.0  # beta-VAE 的 KL 惩罚系数
+    term_dims: tuple[int, ...] = (0,)
+    
+    logvar_min: float = -10.0
+    logvar_max: float = 10.0
+    
+    # 优化器配置
+    learning_rate: float = 1e-3
+    max_grad_norm: float | None = 1.0
+    optimizer_type: str = "adam"
+    weight_decay: float = 1e-5
 
-class CENetVAE(nn.Module):
+    def __post_init__(self) -> None:
+        self.obs_dim = int(self.obs_dim)
+        self.history_length = int(self.history_length)
+        self.latent_dim = int(self.latent_dim)
+        self.activation = self.activation.lower()
+
+
+# ---------------------------------------------------------
+# 数据类：修正了论文中的输出结构
+# z 是随机变量(带mu, logvar), v 是确定性估计(仅 v_est)
+# ---------------------------------------------------------
+@dataclass
+class CENetState:
+    z: torch.Tensor          # Context vector sample (z_t)
+    z_mu: torch.Tensor       # Prior mean
+    z_logvar: torch.Tensor   # Prior log variance
+    v_est: torch.Tensor      # Body linear velocity estimation (v_t)
+
+
+@dataclass
+class CENetMetrics:
+    loss_ce: float           # L_CE (Total Loss)
+    loss_est: float          # L_est (Velocity MSE)
+    loss_vae: float          # L_VAE (Recons + Beta * KL)
+    loss_recons: float       # Next obs reconstruction MSE
+    loss_kld: float          # KL Divergence of z
+    valid_ratio: float
+
+
+class CENet(nn.Module):
     """
-    Reusable CENet-style VAE module.
-
-    Inputs:
-      obs_history: [B, T, obs_dim]
-      next_obs: [B, obs_dim]
-      target_velocity: [B, 3]
+    Context Estimation Network (CENet) exactly as described in the DreamWaQ paper.
+    Contains explicit velocity estimation and implicit context inference via beta-VAE.
     """
 
-    def __init__(self, cfg: CENetVAEConfig) -> None:
+    def __init__(self, cfg: CENetConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self.z_dim = cfg.latent_dim
+        self.vel_dim = 3  # 线速度 v_t 固定为3维 (x, y, z)
+        
         encoder_in_dim = cfg.obs_dim * cfg.history_length
-        encoder_out_dim = cfg.latent_dim * 4
-
+        # 共享编码器的输出特征维度，随意定一个中间值
+        encoder_out_dim = 64 
+        
         self.encoder = _build_mlp(
             in_dim=encoder_in_dim,
             hidden_dims=cfg.encoder_hidden_dims,
             out_dim=encoder_out_dim,
             activation=cfg.activation,
-            last_activation=True, 
+            last_activation=True,
         )
         
-        self.z_dim = cfg.latent_dim          # 16
-        self.vel_dim = 3
-        self.total_param_dim = 2 * self.z_dim + 2 * self.vel_dim  # 38
-        self.shared_head = nn.Linear(encoder_out_dim, self.total_param_dim)
-        nn.init.orthogonal_(self.shared_head.weight)
-        nn.init.constant_(self.shared_head.bias, 0.0)
-
+        # 💡 核心修正 1：输出由 (mu_z, logvar_z, v_est) 组成
+        # z_dim * 2 (给隐变量 z 的均值和对数方差) + vel_dim (确定性的速度预测)
+        self.shared_head = nn.Linear(encoder_out_dim, 2 * self.z_dim + self.vel_dim)
+        
+        # 解码器输入：根据架构图，z_t 和 v_t 拼接后送入 Decoder
         self.decoder = _build_mlp(
-            in_dim=cfg.latent_dim + 3,
+            in_dim=self.z_dim + self.vel_dim,
             hidden_dims=cfg.decoder_hidden_dims,
             out_dim=cfg.obs_dim,
             activation=cfg.activation,
-            last_activation=False, # 解码器最后输出就是物理数值，不需要激活
         )
+        
+        valid_obs_dims = [i for i in range(cfg.obs_dim) if i not in cfg.term_dims]
+        self.register_buffer("recons_valid_idx", torch.tensor(valid_obs_dims, dtype=torch.long))
+
         self.apply(_orthogonal_init)
 
-    def forward(self, obs_history: torch.Tensor, deterministic: bool = True) -> Dict[str, torch.Tensor]:
-        """
-        标准前向传播函数，规范化 Module 结构。
-        默认进行确定性推理 (deterministic=True)，抛弃噪声采样。
-        """
-        return self.predict(obs_history, deterministic=deterministic, decode_next_obs=False)
-
     def create_optimizer(self) -> torch.optim.Optimizer:
-        opt_type = self.cfg.optimizer_type.lower()
+        if self.cfg.optimizer_type == "adam":
+            return torch.optim.Adam(self.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
+        raise ValueError(f"Unsupported optimizer")
+
+    def encode(self, obs_history: torch.Tensor) -> CENetState:
+        """编码观测历史，分离出隐变量 z 的分布和确定的速度估计 v_t"""
+        features = self.encoder(obs_history.flatten(start_dim=1))
         
-        if opt_type == "adam":
-            return torch.optim.Adam(
-                self.parameters(), 
-                lr=self.cfg.learning_rate, 
-                weight_decay=self.cfg.weight_decay
-            )
-        elif opt_type == "adamw":
-            return torch.optim.AdamW(
-                self.parameters(), 
-                lr=self.cfg.learning_rate, 
-                weight_decay=self.cfg.weight_decay
-            )
-        elif opt_type == "sgd":
-            return torch.optim.SGD(
-                self.parameters(), 
-                lr=self.cfg.learning_rate, 
-                weight_decay=self.cfg.weight_decay,
-                momentum=0.9
-            )
-        else:
-            raise ValueError(f"Unsupported optimizer type: {opt_type}")
-
-    @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def encode(self, obs_history: torch.Tensor) -> Dict[str, torch.Tensor]:
-        bs = obs_history.shape[0]
-        features = self.encoder(obs_history.reshape(bs, -1))
-        # 1 次共享投影 → 联合学习 4 组参数
-        params = self.shared_head(features)
-        # 零成本按维度切分
-        z_mu, z_logvar, vel_mu, vel_logvar = params.split(
-            [self.z_dim, self.z_dim, self.vel_dim, self.vel_dim], dim=-1
+        # 按维度截断：z_mu, z_logvar, v_est
+        z_mu, z_logvar, v_est = self.shared_head(features).split(
+            [self.z_dim, self.z_dim, self.vel_dim], dim=-1
         )
-        return {
-            "z_mu": z_mu,
-            "z_logvar": z_logvar,
-            "vel_mu": vel_mu,
-            "vel_logvar": vel_logvar,
-        }
+        
+        z_logvar = torch.clamp(z_logvar, self.cfg.logvar_min, self.cfg.logvar_max)
+        
+        # 仅对 z 进行重参数化采样，v_est 直接输出
+        z = z_mu + torch.exp(0.5 * z_logvar) * torch.randn_like(z_mu)
+        
+        return CENetState(z=z, z_mu=z_mu, z_logvar=z_logvar, v_est=v_est)
 
-    def decode(self, z: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
-        return self.decoder(torch.cat([z, velocity], dim=-1))
+    def decode(self, z: torch.Tensor, v_est: torch.Tensor) -> torch.Tensor:
+        """联合 z_t 和 v_t 重建下一时刻的观测 O_{t+1}"""
+        return self.decoder(torch.cat([z, v_est], dim=-1))
 
-    def predict(
-        self,
-        obs_history: torch.Tensor,
-        deterministic: bool = False,
-        decode_next_obs: bool = False,
-        decode_velocity: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        latent = self.encode(obs_history)
-        if deterministic:
-            z = latent["z_mu"]
-            vel = latent["vel_mu"]
-        else:
-            z = self.reparameterize(latent["z_mu"], latent["z_logvar"])
-            vel = self.reparameterize(latent["vel_mu"], latent["vel_logvar"])
+    # --- 暴露给 RL 的接口 ---
+    
+    def inference(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rollout 使用：返回采样的上下文 z_t 和速度估计 v_t"""
+        state = self.encode(obs_history)
+        return state.z, state.v_est
+        
+    def evaluate(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """测试阶段使用：取分布均值，消除随机性"""
+        state = self.encode(obs_history)
+        return state.z_mu, state.v_est
 
-        out = {
-            "z": z,
-            "velocity": vel,
-            **latent,
-        }
-        if decode_next_obs:
-            vel_for_decode = decode_velocity if decode_velocity is not None else vel
-            out["next_obs_pred"] = self.decode(z, vel_for_decode)
-        return out
+    # 💡 核心修正 3：加入 AdaBoot (自适应引导) 的计算公式
+    @staticmethod
+    def compute_adaboot_prob(episode_rewards: torch.Tensor, eps: float = 1e-5) -> float:
+        """
+        计算论文中的自适应引导概率 p_boot = 1 - tanh(CV(R))
+        :param episode_rewards: 当前 batch/环境池 中的回合奖励 (Tensor)
+        :return: 使用 bootstrap (估计状态) 的概率
+        """
+        if episode_rewards.numel() <= 1:
+            return 1.0  # 默认完全引导
+            
+        mean_r = episode_rewards.mean()
+        std_r = episode_rewards.std()
+        
+        # 变异系数 Coefficient of Variation
+        cv_r = std_r / (mean_r.abs() + eps) 
+        
+        # tanh 将上限平滑地变为 1
+        p_boot = 1.0 - torch.tanh(cv_r).item()
+        
+        # 返回概率约束在 [0, 1] 之间
+        return max(0.0, min(1.0, p_boot))
 
-    def compute_loss(
-        self,
-        obs_history: torch.Tensor,
-        next_obs: torch.Tensor,
-        target_velocity: torch.Tensor,
-        beta: Optional[float] = None,
-    ) -> Dict[str, torch.Tensor]:
-        if beta is None:
-            beta = self.cfg.beta
-
-        pred = self.predict(obs_history, deterministic=False, decode_next_obs=False)
-        z = pred["z"]
-        vel_sample = pred["velocity"]
-        z_mu = pred["z_mu"]
-        z_logvar = pred["z_logvar"]
-        vel_mu = pred["vel_mu"]
-
-        if self.cfg.decode_with_target_velocity:
-            next_obs_pred = self.decode(z, target_velocity)
-        else:
-            next_obs_pred = self.decode(z, vel_sample)
-
-        vel_for_loss = vel_sample if self.cfg.velocity_loss_use_sample else vel_mu
-
-        recons_loss = F.mse_loss(next_obs_pred, next_obs, reduction="none").mean(dim=-1)
-        vel_loss = F.mse_loss(vel_for_loss, target_velocity, reduction="none").mean(dim=-1)
-        kld_loss = -0.5 * torch.sum(1.0 + z_logvar - z_mu.pow(2) - z_logvar.exp(), dim=-1)
-
-        total_loss = recons_loss + vel_loss + beta * kld_loss
-        return {
-            "loss": total_loss,
-            "recons_loss": recons_loss,
-            "vel_loss": vel_loss,
-            "kld_loss": kld_loss,
-        }
-
+    # ---------------------------------------------------------
+    # 💡 核心修正 2：损失函数完全对齐论文公式
+    # ---------------------------------------------------------
     def update_step(
         self,
         optimizer: torch.optim.Optimizer,
         obs_history: torch.Tensor,
         next_obs: torch.Tensor,
         target_velocity: torch.Tensor,
-        dones: Optional[torch.Tensor] = None,
-        beta: Optional[float] = None,
-        max_grad_norm: Optional[float] = None,
-    ) -> Dict[str, float]:
+        dones: torch.Tensor | None = None,
+    ) -> CENetMetrics:
+        
         self.train()
-        if max_grad_norm is None:
-            max_grad_norm = self.cfg.max_grad_norm
 
-        loss_dict = self.compute_loss(
-            obs_history=obs_history,
-            next_obs=next_obs,
-            target_velocity=target_velocity,
-            beta=beta,
-        )
+        # 1. 前向传播
+        state = self.encode(obs_history)
+        
+        # 注意：依据架构图，Decoder 是接受估计的速度 (v_est) 和 z_t 作为输入的
+        next_obs_pred = self.decode(state.z, state.v_est)
 
+        # 2. 计算各部分损失
+        
+        # 公式: L_est = MSE(\tilde{v}_t, v_t)
+        loss_est = nn.functional.mse_loss(state.v_est, target_velocity, reduction="none").mean(dim=-1)
+        
+        # 公式: MSE(\tilde{o}_{t+1}, o_{t+1}) (剔除特权信息)
+        loss_recons = nn.functional.mse_loss(
+            next_obs_pred[..., self.recons_valid_idx], 
+            next_obs[..., self.recons_valid_idx], 
+            reduction="none"
+        ).mean(dim=-1)
+        
+        # 公式: KL( q(z_t | o_H) || p(z_t) )，先验 p(z) 为标准正态分布
+        loss_kld = -0.5 * torch.sum(1.0 + state.z_logvar - state.z_mu.pow(2) - state.z_logvar.exp(), dim=-1)
+        
+        # 公式: L_VAE = MSE_recons + \beta * D_KL
+        loss_vae = loss_recons + self.cfg.beta * loss_kld
+        
+        # 公式: L_CE = L_est + L_VAE
+        loss_ce = loss_est + loss_vae
+
+        # 3. 处理掩码并计算均值 (消除无效 done step)
         if dones is not None:
-            valid = (dones.reshape(-1) == 0)
-            if valid.any():
-                optimize_loss = loss_dict["loss"][valid].mean()
-                metrics = {
-                    "loss": optimize_loss.detach().item(),
-                    "recons_loss": loss_dict["recons_loss"][valid].mean().detach().item(),
-                    "vel_loss": loss_dict["vel_loss"][valid].mean().detach().item(),
-                    "kld_loss": loss_dict["kld_loss"][valid].mean().detach().item(),
-                    "valid_ratio": valid.float().mean().detach().item(),
-                }
-            else:
-                return {
-                    "loss": 0.0,
-                    "recons_loss": 0.0,
-                    "vel_loss": 0.0,
-                    "kld_loss": 0.0,
-                    "valid_ratio": 0.0,
-                }
+            mask = (dones.reshape(-1) == 0).float()
         else:
-            optimize_loss = loss_dict["loss"].mean()
-            metrics = {
-                "loss": optimize_loss.detach().item(),
-                "recons_loss": loss_dict["recons_loss"].mean().detach().item(),
-                "vel_loss": loss_dict["vel_loss"].mean().detach().item(),
-                "kld_loss": loss_dict["kld_loss"].mean().detach().item(),
-                "valid_ratio": 1.0,
-            }
+            mask = torch.ones_like(loss_ce)
+            
+        mask_sum = mask.sum()
+        valid_ratio = (mask_sum / mask.numel()).item()
 
+        if mask_sum < 1e-5:
+            return CENetMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+        # 加权求均值
+        optimize_loss = (loss_ce * mask).sum() / mask_sum
+
+        # 4. 反向传播更新
         optimizer.zero_grad(set_to_none=True)
         optimize_loss.backward()
-        if max_grad_norm is not None and max_grad_norm > 0.0:
-            nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+        if self.cfg.max_grad_norm is not None and self.cfg.max_grad_norm > 0.0:
+            nn.utils.clip_grad_norm_(self.parameters(), self.cfg.max_grad_norm)
         optimizer.step()
-        return metrics
+
+        # 5. 日志数据
+        return CENetMetrics(
+            loss_ce=optimize_loss.detach().item(),
+            loss_est=((loss_est * mask).sum() / mask_sum).detach().item(),
+            loss_vae=((loss_vae * mask).sum() / mask_sum).detach().item(),
+            loss_recons=((loss_recons * mask).sum() / mask_sum).detach().item(),
+            loss_kld=((loss_kld * mask).sum() / mask_sum).detach().item(),
+            valid_ratio=valid_ratio
+        )
